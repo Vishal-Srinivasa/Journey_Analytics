@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 from typing import Any, Dict, List
 from mcp import ClientSession
 from mcp.client.sse import sse_client
@@ -118,9 +119,49 @@ class GeminiNeonBridge:
         
         try:
             result = await self.session.call_tool(tool_name, arguments=arguments)
-            return result
+            return self._normalize_tool_result(result)
         except Exception as e:
             return {"error": str(e)}
+
+    def _normalize_tool_result(self, result: Any) -> Any:
+        if isinstance(result, dict):
+            return result
+
+        content_items = None
+        if hasattr(result, "content"):
+            try:
+                content_items = list(result.content)
+            except Exception:
+                content_items = None
+
+        if content_items is not None:
+            texts: List[str] = []
+            for item in content_items:
+                text = None
+                if hasattr(item, "text"):
+                    text = item.text
+                elif isinstance(item, dict):
+                    text = item.get("text")
+                if text:
+                    texts.append(text)
+
+            raw_text = "\n".join(texts).strip()
+            if raw_text:
+                try:
+                    parsed = json.loads(raw_text)
+                    return {
+                        "parsed": parsed,
+                        "raw_text": raw_text,
+                    }
+                except Exception:
+                    return {
+                        "raw_text": raw_text,
+                    }
+
+        try:
+            return {"result": str(result)}
+        except Exception:
+            return {"result": "<unserializable result>"}
     
     def _initialize_gemini_model(self, model_name: str = "gemini-2.0-flash-exp"):
         """Initialize Gemini model and chat session (only once)"""
@@ -200,6 +241,9 @@ CRITICAL BEHAVIOR RULES:
 3. PROACTIVE QUERIES: If asked "show me nodes for id 1" or similar, immediately execute: SELECT * FROM papi_automation WHERE id = 1
 4. RESULT PRESENTATION: After executing queries, format and explain results clearly to the user.
 5. SCHEMA EXPLORATION: Use `get_database_tables` or `describe_table_schema` if you need to understand the database structure first.
+6. ITERATIVE TOOL USE: If the answer requires multiple steps or missing context, keep calling tools until you have what you need. Do not ask the user for database context.
+7. ONE STEP AT A TIME: Execute only one tool call at a time. Analyze the result, then decide the next query.
+8. SHOW SQL: When you call run_sql, clearly state which SQL you executed.
 
 WORKFLOW EXAMPLES:
 
@@ -259,95 +303,123 @@ id in papi_automation table is same as aid in journey_xray table
         # Start chat session (persistent - maintains history)
         self.chat = self.model.start_chat()
     
-    async def chat_with_gemini(self, user_message: str, model_name: str = "gemini-2.0-flash-exp") -> str:
-        """Chat with Gemini, allowing it to use Neon MCP tools with persistent memory"""
+    async def chat_with_gemini_with_tools(
+        self,
+        user_message: str,
+        model_name: str = "gemini-2.0-flash-exp",
+        max_iterations: int = 20,
+    ) -> Dict[str, Any]:
+        """Chat with Gemini and return both text and tool call results."""
         if not self.session:
             await self.connect_to_neon()
-        
+
         # Initialize model and chat if not already done
         if self.model is None or self.chat is None:
             self._initialize_gemini_model(model_name)
-        
+
         # Send message to existing chat (maintains conversation history)
         response = self.chat.send_message(user_message)
-        
+
         # Handle function calls in a loop
-        max_iterations = 10  # Prevent infinite loops
         iteration = 0
-        
+        tool_calls: List[Dict[str, Any]] = []
+
         while iteration < max_iterations:
             iteration += 1
-            
+
             # Check if there's a function call
             if not response.candidates:
                 break
-                
+
             candidate = response.candidates[0]
             if not hasattr(candidate, 'content') or not candidate.content.parts:
                 break
-            
+
             # Check for function calls
             function_calls = []
             for part in candidate.content.parts:
                 if hasattr(part, 'function_call') and part.function_call:
                     function_calls.append(part.function_call)
-            
+
             if not function_calls:
                 break
-            
-            # Execute all function calls
+
+            # Execute only the first function call to enforce step-by-step analysis
             function_responses = []
-            for function_call in function_calls:
-                function_name = function_call.name
-                # Convert args to dict
-                function_args = {}
-                if hasattr(function_call, 'args'):
-                    if isinstance(function_call.args, dict):
-                        function_args = function_call.args
-                    else:
-                        # Try to convert protobuf to dict
-                        try:
-                            function_args = dict(function_call.args)
-                        except:
-                            function_args = {}
-                
-                print(f"\n🔧 Gemini wants to call: {function_name}")
-                print(f"   Arguments: {json.dumps(function_args, indent=2)}")
-                
-                # Execute the function
-                function_result = await self.execute_tool_call(function_name, function_args)
-                
-                # Convert result to dict for Gemini
-                if isinstance(function_result, dict):
-                    result_dict = function_result
+            function_call = function_calls[0]
+            function_name = function_call.name
+            # Convert args to dict
+            function_args = {}
+            if hasattr(function_call, 'args'):
+                if isinstance(function_call.args, dict):
+                    function_args = function_call.args
                 else:
-                    result_dict = {'result': str(function_result)}
-                
-                print(f"✅ Tool executed successfully")
-                
-                # Create function response
-                function_responses.append(
-                    genai.protos.Part(
-                        function_response=genai.protos.FunctionResponse(
-                            name=function_name,
-                            response=result_dict
-                        )
+                    # Try to convert protobuf to dict
+                    try:
+                        function_args = dict(function_call.args)
+                    except Exception:
+                        function_args = {}
+
+            print(f"\n🔧 Gemini wants to call: {function_name}")
+            print(f"   Arguments: {json.dumps(function_args, indent=2)}")
+
+            # Execute the function
+            function_result = await self.execute_tool_call(function_name, function_args)
+
+            # Convert result to dict for Gemini
+            if isinstance(function_result, dict):
+                result_dict = function_result
+            else:
+                result_dict = {'result': str(function_result)}
+
+            sql_text = None
+            if function_name == "run_sql":
+                sql_text = function_args.get("query") or function_args.get("sql")
+
+            tool_calls.append(
+                {
+                    "name": function_name,
+                    "arguments": function_args,
+                    "response": result_dict,
+                    "sql": sql_text,
+                }
+            )
+
+            print(f"✅ Tool executed successfully")
+
+            # Create function response
+            function_responses.append(
+                genai.protos.Part(
+                    function_response=genai.protos.FunctionResponse(
+                        name=function_name,
+                        response=result_dict,
                     )
                 )
-            
+            )
+
             # Send function responses back to Gemini (using persistent chat)
             response = self.chat.send_message(function_responses)
-        
+
         # Extract text response
         if response.candidates and response.candidates[0].content.parts:
             text_parts = [
-                part.text 
-                for part in response.candidates[0].content.parts 
+                part.text
+                for part in response.candidates[0].content.parts
                 if hasattr(part, 'text') and part.text
             ]
-            return ' '.join(text_parts) if text_parts else str(response)
-        
-        return str(response)
+            text_response = ' '.join(text_parts) if text_parts else str(response)
+        else:
+            text_response = str(response)
+
+        return {
+            "text": text_response,
+            "tool_calls": tool_calls,
+        }
+
+    async def chat_with_gemini(self, user_message: str, model_name: str = "gemini-2.0-flash-exp") -> str:
+        """Chat with Gemini, allowing it to use Neon MCP tools with persistent memory"""
+        result = await self.chat_with_gemini_with_tools(user_message, model_name=model_name)
+        return result.get("text", "")
     
     def reset_conversation(self):
         """Reset the conversation history (start a new chat)"""
@@ -383,14 +455,13 @@ Remember: Execute the SQL query automatically using the run_sql tool. Do not jus
 
 async def main():
     """Example usage"""
-    # Configuration - Replace with your actual keys
-    NEON_API_KEY = "napi_hvi7pyuxz298lh9knvset2mbo6l6oc1hg1qpdd7qf6xg90mxr5lkco4zek3dy230"
-    GEMINI_API_KEY = "AIzaSyAJhStqoy_zSxolzyUZXcFJJClkoNFILc8"  # Get from https://makersuite.google.com/app/apikey
-    PROJECT_ID = "late-brook-11506963"
-    
-    if GEMINI_API_KEY == "YOUR_GEMINI_API_KEY":
-        print("⚠️  Please set your GEMINI_API_KEY in the code!")
-        print("   Get one from: https://makersuite.google.com/app/apikey")
+    # Configuration - Read from environment
+    NEON_API_KEY = os.getenv("NEON_API_KEY")
+    GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")  # Get from https://makersuite.google.com/app/apikey
+    PROJECT_ID = os.getenv("NEON_PROJECT_ID")
+
+    if not NEON_API_KEY or not GEMINI_API_KEY or not PROJECT_ID:
+        print("⚠️  Please set NEON_API_KEY, GEMINI_API_KEY, and NEON_PROJECT_ID in your environment.")
         return
     
     bridge = GeminiNeonBridge(NEON_API_KEY, GEMINI_API_KEY, PROJECT_ID)
