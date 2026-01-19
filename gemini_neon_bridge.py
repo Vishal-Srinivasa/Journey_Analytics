@@ -384,9 +384,9 @@ Remember: Execute the SQL query automatically using the run_sql tool. Do not jus
 async def main():
     """Example usage"""
     # Configuration - Replace with your actual keys
-    NEON_API_KEY = "napi_hvi7pyuxz298lh9knvset2mbo6l6oc1hg1qpdd7qf6xg90mxr5lkco4zek3dy230"
-    GEMINI_API_KEY = "AIzaSyAJhStqoy_zSxolzyUZXcFJJClkoNFILc8"  # Get from https://makersuite.google.com/app/apikey
-    PROJECT_ID = "late-brook-11506963"
+    NEON_API_KEY = ""
+    GEMINI_API_KEY = ""  # Get from https://makersuite.google.com/app/apikey
+    PROJECT_ID = ""
     
     if GEMINI_API_KEY == "YOUR_GEMINI_API_KEY":
         print("⚠️  Please set your GEMINI_API_KEY in the code!")
